@@ -1,268 +1,122 @@
-# app.py (updated)
-import asyncio
-import base64
-import time
-import traceback
-import os
-import shutil
-from typing import List, Optional
-
-from urllib.request import Request, urlopen, ProxyHandler, build_opener, install_opener
-from urllib.error import URLError, HTTPError
-
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
-
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.service import Service as ChromeService
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-
-# ----- Optional chromedriver autoinstaller support (if installed) -----
-_try_chromedriver_autoinstaller = True
-try:
-    import chromedriver_autoinstaller
-except Exception:
-    chromedriver_autoinstaller = None
-    _try_chromedriver_autoinstaller = False
-
-# ----- Configurable defaults -----
-DEFAULT_WAIT_TIME = 25
-DEFAULT_JS_POLL_TIMEOUT = 45
-DEFAULT_JS_POLL_INTERVAL = 1.0
-DEFAULT_MAX_SCROLL_LOOPS = 60
-DEFAULT_SCROLL_PAUSE = 1.0
-# ---------------------------------
-
-app = FastAPI(title="AffordableHousing Boost API", version="1.0")
-
-
-class BoostRequest(BaseModel):
-    email: str
-    password: str
-    num_buttons: int = Field(1, ge=1)
-    headless: bool = True
-    wait_time: Optional[int] = DEFAULT_WAIT_TIME
-
-
-class BoostResponse(BaseModel):
-    success: bool
-    clicked_count: int
-    clicked_addresses: List[Optional[str]]
-    debug_logs: List[str]
-    error: Optional[str] = None
-    screenshot_base64: Optional[str] = None
-
-
-# ---------- helper: locate chrome & chromedriver ----------
-COMMON_CHROME_PATHS = [
-    "/usr/bin/chromium",
-    "/usr/bin/chromium-browser",
-    "/usr/bin/google-chrome",
-    "/usr/bin/google-chrome-stable",
-    "/usr/local/bin/chromium",
-    "/snap/bin/chromium",
-]
-
-COMMON_CHROMEDRIVER_PATHS = [
-    "/usr/bin/chromedriver",
-    "/usr/bin/chromium-driver",
-    "/usr/local/bin/chromedriver",
-    "/opt/chromedriver",
-]
-
-
-def find_chrome_binary() -> Optional[str]:
-    env = os.environ.get("CHROME_BIN") or os.environ.get("GOOGLE_CHROME_SHIM")
-    if env and os.path.isfile(env):
-        return env
-    for exe in ("chromium", "chromium-browser", "google-chrome", "google-chrome-stable", "chrome"):
-        p = shutil.which(exe)
-        if p:
-            return p
-    for p in COMMON_CHROME_PATHS:
-        if os.path.isfile(p):
-            return p
-    return None
-
-
-def find_chromedriver_binary() -> Optional[str]:
-    env = os.environ.get("CHROMEDRIVER_PATH") or os.environ.get("CHROMEDRIVER_BIN")
-    if env and os.path.isfile(env):
-        return env
-    p = shutil.which("chromedriver")
-    if p:
-        return p
-    for pth in COMMON_CHROMEDRIVER_PATHS:
-        if os.path.isfile(pth):
-            return pth
-    if _try_chromedriver_autoinstaller and chromedriver_autoinstaller is not None:
-        chrome_bin = find_chrome_binary()
-        if chrome_bin:
-            try:
-                installed = chromedriver_autoinstaller.install(path="/tmp")
-                if installed and os.path.isfile(installed):
-                    return installed
-            except Exception:
-                pass
-    return None
-
-
-# ---------- small DOM helpers ----------
-def get_element_text_via_js(drv, el):
-    try:
-        txt = drv.execute_script(
-            "return (arguments[0].innerText || arguments[0].textContent || '').trim();", el
-        )
-        return (txt or "").strip()
-    except Exception:
-        return ""
-
-
-def find_address_for_button(drv, btn):
-    try:
-        for xp in [
-            "./ancestor::div[contains(@class,'listing--card')][1]",
-            "./ancestor::div[contains(@class,'listing--item')][1]",
-            "./ancestor::div[contains(@class,'listing--property--wrapper')][1]",
-        ]:
-            try:
-                anc = btn.find_element(By.XPATH, xp)
-                addr_el = anc.find_element(By.CSS_SELECTOR,
-                                           "div.listing--property--address span, div.listing--property--address")
-                addr = get_element_text_via_js(drv, addr_el)
-                if addr:
-                    return addr
-            except Exception:
-                continue
-        try:
-            addr_el = btn.find_element(By.XPATH,
-                                       "preceding::div[contains(@class,'listing--property--address')][1]//span")
-            addr = get_element_text_via_js(drv, addr_el)
-            if addr:
-                return addr
-        except Exception:
-            pass
-    except Exception:
-        pass
-    return None
-
-
-# ---------- network pre-check helper ----------
-def network_precheck(test_url: str, timeout: int, logs: List[str]) -> None:
-    """
-    Raises Exception on failure unless SKIP_NETWORK_CHECK is set.
-    Supports HTTPS_PROXY / HTTP_PROXY environment variables.
-    """
-    skip_check = os.environ.get("SKIP_NETWORK_CHECK", "").lower() in ("1", "true", "yes")
-    proxy_env = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
-
-    if skip_check:
-        logs.append("SKIP_NETWORK_CHECK=true -> skipping network pre-check")
-        return
-
-    logs.append(f"Connectivity quick-check to {test_url}")
-    opener = None
-    try:
-        if proxy_env:
-            # ProxyHandler expects e.g. {'http': 'http://host:port', 'https': 'http://host:port'}
-            logs.append(f"Using proxy for pre-check: {proxy_env}")
-            ph = ProxyHandler({"http": proxy_env, "https": proxy_env})
-            opener = build_opener(ph)
-            install_opener(opener)
-
-        # Try HEAD first because it's lighter; fall back to GET if HEAD fails
-        req = Request(test_url, method="HEAD")
-        try:
-            with urlopen(req, timeout=timeout) as resp:
-                status = getattr(resp, "status", None)
-                logs.append(f"HEAD status_code={status}")
-                return
-        except HTTPError as he:
-            # Some servers block HEAD - try GET fallback
-            logs.append(f"HEAD failed with HTTPError {he.code}, trying GET fallback")
-        except URLError as ue:
-            logs.append(f"HEAD URLError: {ue}")
-        except Exception as e:
-            logs.append(f"HEAD exception: {e}")
-
-        # GET fallback
-        try:
-            req2 = Request(test_url, method="GET")
-            with urlopen(req2, timeout=timeout) as resp:
-                status = getattr(resp, "status", None)
-                logs.append(f"GET status_code={status}")
-                return
-        except Exception as e:
-            # Bubble up a more descriptive error
-            raise Exception(f"Network pre-check failed: {e}")
-    finally:
-        # ensure we don't leave any custom opener globally if none was set earlier
-        pass
-
-
 # ---------- consent popup helper ----------
-def dismiss_consent_popup(driver, logs):
+def dismiss_consent_popup(driver, logs, max_attempts: int = 3):
     """
-    Try to detect and dismiss common consent/cookie popups that block the page.
-    Non-fatal: logs attempts and returns if nothing found.
+    Aggressively tries to dismiss cookie/consent popups.
+    Returns True if popup dismissed (or not present), False if still present.
+    Non-fatal, logs attempts.
     """
     try:
-        # Wait briefly for any dialog/consent element to appear
-        WebDriverWait(driver, 3).until(
-            EC.presence_of_element_located(
-                (By.XPATH, "//div[contains(translate(@class,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'consent') or "
-                          "contains(translate(@class,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'cookie') or "
-                          "contains(@role,'dialog')]")
-            )
-        )
-        logs.append("Consent popup detected - attempting to close it")
-    except Exception:
-        logs.append("No consent popup detected (quick-check)")
-        return
+        for attempt in range(1, max_attempts + 1):
+            logs.append(f"Consent dismissal attempt {attempt}/{max_attempts}")
+            # Candidate CSS selectors (explicit ones first)
+            selectors = [
+                "button#onetrust-accept-btn-handler",
+                "button[id*='accept']",
+                "button[id*='consent']",
+                "button[class*='accept']",
+                "button[class*='consent']",
+                "button[aria-label*='accept']",
+                "button[aria-label*='consent']",
+                "button[title*='Accept']",
+                "button[title*='Consent']",
+                "a[id*='accept']",
+                "a[class*='accept']",
+            ]
 
-    # Try a set of XPath selectors for common consent/accept buttons/links
-    xpaths = [
-        "//button[@id='onetrust-accept-btn-handler']",
-        "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'accept')]",
-        "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'consent')]",
-        "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'agree')]",
-        "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'allow')]",
-        "//a[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'accept')]",
-        "//div[contains(translate(@class,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'consent')]//button",
-        "//div[contains(translate(@class,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'cookie')]//button",
-    ]
-
-    for xp in xpaths:
-        try:
-            elems = driver.find_elements(By.XPATH, xp)
-            if not elems:
-                continue
-            for el in elems:
+            # Try explicit selectors
+            for sel in selectors:
                 try:
-                    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
-                    time.sleep(0.3)
-                    el.click()
-                    logs.append(f"Clicked consent element via xpath: {xp}")
-                    time.sleep(0.8)
-                    return
+                    elems = driver.find_elements(By.CSS_SELECTOR, sel)
                 except Exception:
+                    elems = []
+                if elems:
+                    for el in elems:
+                        try:
+                            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+                            time.sleep(0.25)
+                            el.click()
+                            logs.append(f"Clicked consent using selector: {sel}")
+                            time.sleep(0.6)
+                            return True
+                        except Exception:
+                            try:
+                                driver.execute_script("arguments[0].click();", el)
+                                logs.append(f"JS-clicked consent using selector: {sel}")
+                                time.sleep(0.6)
+                                return True
+                            except Exception:
+                                continue
+
+            # Text-match fallback across all buttons and links
+            try:
+                candidates = driver.find_elements(By.TAG_NAME, "button") + driver.find_elements(By.TAG_NAME, "a")
+                for el in candidates:
                     try:
-                        # fallback to JS click if normal click fails
-                        driver.execute_script("arguments[0].click();", el)
-                        logs.append(f"Clicked consent via JS fallback xpath: {xp}")
-                        time.sleep(0.8)
-                        return
+                        txt = (el.text or "").strip().lower()
+                        if any(k in txt for k in ("accept", "consent", "agree", "allow", "ok", "yes", "manage options", "consent and proceed")):
+                            try:
+                                driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+                                time.sleep(0.2)
+                                el.click()
+                                logs.append(f"Clicked consent by text match: '{txt[:40]}'")
+                                time.sleep(0.6)
+                                return True
+                            except Exception:
+                                try:
+                                    driver.execute_script("arguments[0].click();", el)
+                                    logs.append(f"JS-clicked consent by text match: '{txt[:40]}'")
+                                    time.sleep(0.6)
+                                    return True
+                                except Exception:
+                                    continue
                     except Exception:
                         continue
-        except Exception:
-            continue
+            except Exception:
+                pass
 
-    logs.append("Consent popup present but no known button found to dismiss")
+            # Last-resort: remove overlay-like nodes via JS (non-destructive best-effort)
+            try:
+                js_remove = """
+                (function(){
+                  const patterns = ['consent','cookie','ccpa','gdpr','banner','overlay','modal','dialog'];
+                  let removed = 0;
+                  patterns.forEach(p=>{
+                    document.querySelectorAll('[id*='+JSON.stringify(p)+'], [class*='+JSON.stringify(p)+'], [role=\"dialog\"]').forEach(el=>{
+                      try{ el.style.display='none'; el.remove(); removed++; }catch(e){}
+                    });
+                  });
+                  // Hide obvious full-screen overlays (high z-index & non-transparent)
+                  document.querySelectorAll('div').forEach(d=>{
+                    try{
+                      const s = window.getComputedStyle(d);
+                      if (s && s.position && s.zIndex && parseInt(s.zIndex||0) > 1000 && s.backgroundColor && s.backgroundColor !== 'rgba(0, 0, 0, 0)'){
+                        d.style.display='none'; d.remove(); removed++;
+                      }
+                    }catch(e){}
+                  });
+                  return removed;
+                })();
+                """
+                removed_count = driver.execute_script(js_remove)
+                logs.append(f"Attempted overlay removal via JS, removed_count={removed_count}")
+                if removed_count > 0:
+                    time.sleep(0.5)
+                    return True
+            except Exception as e:
+                logs.append(f"Overlay removal attempt failed: {e}")
+
+            # small wait before retry
+            time.sleep(0.8)
+
+        logs.append("Consent popup present but no known button found to dismiss (after retries)")
+        return False
+
+    except Exception as e:
+        logs.append(f"dismiss_consent_popup unexpected error: {e}")
+        return False
 
 
-# ---------- selenium worker ----------
+# ---------- selenium worker (modified only for consent + robust clicks) ----------
 def selenium_boost_worker(email: str, password: str, num_buttons: int, headless: bool,
                           wait_time: int = DEFAULT_WAIT_TIME) -> BoostResponse:
     logs: List[str] = []
@@ -344,9 +198,10 @@ def selenium_boost_worker(email: str, password: str, num_buttons: int, headless:
             try:
                 driver.get("https://www.affordablehousing.com/")
                 logs.append("Opened affordablehousing.com (via driver.get)")
-                # <-- dismiss consent popup right after opening the homepage
+                # Attempt to dismiss cookie/consent overlay right away
                 try:
-                    dismiss_consent_popup(driver, logs)
+                    dismissed = dismiss_consent_popup(driver, logs, max_attempts=3)
+                    logs.append(f"dismiss_consent_popup result: {dismissed}")
                 except Exception as e:
                     logs.append(f"Error while attempting to dismiss consent popup: {e}")
                 break
@@ -372,8 +227,41 @@ def selenium_boost_worker(email: str, password: str, num_buttons: int, headless:
         password_input.send_keys(password)
         logs.append("Entered password")
 
-        wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button#signin-with-password-button"))).click()
-        logs.append("Clicked final Sign In button")
+        # Robust final sign-in click with retries and overlay-removal fallback
+        signin_selector = (By.CSS_SELECTOR, "button#signin-with-password-button")
+        signin_button = wait.until(EC.element_to_be_clickable(signin_selector))
+
+        clicked = False
+        for attempt in range(1, 4):
+            try:
+                driver.execute_script("arguments[0].scrollIntoView({block:'center'});", signin_button)
+                time.sleep(0.4)
+                signin_button.click()
+                clicked = True
+                logs.append("Clicked final Sign In button (normal click)")
+                break
+            except Exception as e:
+                logs.append(f"Sign-in normal click attempt {attempt} failed: {e}")
+                try:
+                    driver.execute_script("arguments[0].click();", signin_button)
+                    clicked = True
+                    logs.append("Clicked final Sign In button (JS fallback)")
+                    break
+                except Exception as je:
+                    logs.append(f"Sign-in JS click attempt {attempt} failed: {je}")
+                    # Try to remove likely overlay nodes and retry
+                    try:
+                        driver.execute_script("""
+                            document.querySelectorAll('[class*="consent"], [class*="overlay"], [class*="cookie"], [role="dialog"]').forEach(e=>{ try{ e.style.display='none'; e.remove(); } catch(e){}});
+                        """)
+                        logs.append("Tried removing overlay nodes after click interception")
+                    except Exception as re:
+                        logs.append(f"Failed overlay cleanup: {re}")
+                    time.sleep(0.6)
+
+        if not clicked:
+            raise Exception("Could not click final sign-in button after multiple attempts")
+        logs.append("Clicked final Sign In button (completed)")
 
         wait.until(EC.url_contains("dashboard"))
         logs.append("Login confirmed (dashboard)")
@@ -477,6 +365,15 @@ def selenium_boost_worker(email: str, password: str, num_buttons: int, headless:
             if driver:
                 screenshot_b64 = driver.get_screenshot_as_base64()
                 logs.append("Captured error screenshot (base64)")
+                # Also save page source for debugging
+                try:
+                    page_html = driver.page_source
+                    path = "/tmp/affordablehousing_page.html"
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.write(page_html)
+                    logs.append(f"Saved page source to {path}")
+                except Exception as e:
+                    logs.append(f"Failed to save page source: {e}")
         except Exception:
             pass
 
@@ -496,76 +393,3 @@ def selenium_boost_worker(email: str, password: str, num_buttons: int, headless:
                 logs.append("Driver.quit() called")
         except Exception:
             pass
-
-
-# ---- endpoints ----
-@app.get("/")
-def health():
-    return {"status": "Boost API running"}
-
-
-@app.get("/browser")
-def browser_test():
-    logs = []
-    chrome_bin = find_chrome_binary()
-    chromedriver_bin = find_chromedriver_binary()
-    logs.append(f"chrome: {chrome_bin or '<none>'}")
-    logs.append(f"chromedriver: {chromedriver_bin or '<none>'}")
-
-    if not chromedriver_bin:
-        raise HTTPException(status_code=500, detail={"error": "chromedriver not found", "logs": logs})
-
-    # Quick remote pre-check using standard library (respect proxy env)
-    try:
-        proxy_env = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
-        if proxy_env:
-            ph = ProxyHandler({"http": proxy_env, "https": proxy_env})
-            opener = build_opener(ph)
-            install_opener(opener)
-            logs.append(f"Using proxy for browser_test: {proxy_env}")
-
-        req = Request("https://www.google.com", method="HEAD")
-        with urlopen(req, timeout=6) as r:
-            logs.append(f"google HEAD ok status={getattr(r,'status',None)}")
-    except Exception as e:
-        logs.append(f"connectivity test failed: {e}")
-        raise HTTPException(status_code=500, detail={"error": "connectivity test failed", "logs": logs})
-
-    options = webdriver.ChromeOptions()
-    options.add_argument("--headless=new")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    if chrome_bin:
-        options.binary_location = chrome_bin
-    options.add_argument("--ignore-certificate-errors")
-
-    proxy_env = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
-    if proxy_env:
-        options.add_argument(f"--proxy-server={proxy_env}")
-
-    service = ChromeService(executable_path=chromedriver_bin)
-    driver = webdriver.Chrome(service=service, options=options)
-    try:
-        driver.get("https://www.google.com")
-        title = driver.title
-    finally:
-        driver.quit()
-    return {"page_title": title, "logs": logs}
-
-
-@app.post("/boost", response_model=BoostResponse)
-async def boost_endpoint(req: BoostRequest):
-    loop = asyncio.get_event_loop()
-    try:
-        result: BoostResponse = await loop.run_in_executor(
-            None,
-            selenium_boost_worker,
-            req.email,
-            req.password,
-            req.num_buttons,
-            req.headless,
-            req.wait_time or DEFAULT_WAIT_TIME
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Server error: {exc}")
-    return result
