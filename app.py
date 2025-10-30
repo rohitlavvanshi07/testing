@@ -202,6 +202,66 @@ def network_precheck(test_url: str, timeout: int, logs: List[str]) -> None:
         pass
 
 
+# ---------- consent popup helper ----------
+def dismiss_consent_popup(driver, logs):
+    """
+    Try to detect and dismiss common consent/cookie popups that block the page.
+    Non-fatal: logs attempts and returns if nothing found.
+    """
+    try:
+        # Wait briefly for any dialog/consent element to appear
+        WebDriverWait(driver, 3).until(
+            EC.presence_of_element_located(
+                (By.XPATH, "//div[contains(translate(@class,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'consent') or "
+                          "contains(translate(@class,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'cookie') or "
+                          "contains(@role,'dialog')]")
+            )
+        )
+        logs.append("Consent popup detected - attempting to close it")
+    except Exception:
+        logs.append("No consent popup detected (quick-check)")
+        return
+
+    # Try a set of XPath selectors for common consent/accept buttons/links
+    xpaths = [
+        "//button[@id='onetrust-accept-btn-handler']",
+        "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'accept')]",
+        "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'consent')]",
+        "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'agree')]",
+        "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'allow')]",
+        "//a[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'accept')]",
+        "//div[contains(translate(@class,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'consent')]//button",
+        "//div[contains(translate(@class,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'cookie')]//button",
+    ]
+
+    for xp in xpaths:
+        try:
+            elems = driver.find_elements(By.XPATH, xp)
+            if not elems:
+                continue
+            for el in elems:
+                try:
+                    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+                    time.sleep(0.3)
+                    el.click()
+                    logs.append(f"Clicked consent element via xpath: {xp}")
+                    time.sleep(0.8)
+                    return
+                except Exception:
+                    try:
+                        # fallback to JS click if normal click fails
+                        driver.execute_script("arguments[0].click();", el)
+                        logs.append(f"Clicked consent via JS fallback xpath: {xp}")
+                        time.sleep(0.8)
+                        return
+                    except Exception:
+                        continue
+        except Exception:
+            continue
+
+    logs.append("Consent popup present but no known button found to dismiss")
+
+
 # ---------- selenium worker ----------
 def selenium_boost_worker(email: str, password: str, num_buttons: int, headless: bool,
                           wait_time: int = DEFAULT_WAIT_TIME) -> BoostResponse:
@@ -284,6 +344,11 @@ def selenium_boost_worker(email: str, password: str, num_buttons: int, headless:
             try:
                 driver.get("https://www.affordablehousing.com/")
                 logs.append("Opened affordablehousing.com (via driver.get)")
+                # <-- dismiss consent popup right after opening the homepage
+                try:
+                    dismiss_consent_popup(driver, logs)
+                except Exception as e:
+                    logs.append(f"Error while attempting to dismiss consent popup: {e}")
                 break
             except Exception as e:
                 logs.append(f"driver.get attempt {attempt} failed: {e}")
